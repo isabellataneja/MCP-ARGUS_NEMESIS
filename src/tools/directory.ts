@@ -1,40 +1,51 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
+import { getClinicianSitePattern, resolveRegion, toolRegionOptional, type Region } from '../filters.js';
+import { getHolidayTable } from '../holidays.js';
 import { asMcpTextContent, instrumented } from '../instrument.js';
 import { db } from '../supabase.js';
-import { BD_CLINICIAN_SITE_PATTERN, BD_MDS_FILTER } from '../filters.js';
+
+const REGION_DESC_PREFIX = 'Region-scoped. Defaults to AX-BD-Dhaka if region not passed. ';
+
+const BD_HOLIDAY_REGION: Region = 'AX-BD-Dhaka';
 
 function throwIfError(context: string, error: { message: string } | null) {
   if (error) throw new Error(`${context}: ${error.message}`);
 }
 
-function holidayInRange(row: Record<string, unknown>, start: string, end: string): boolean {
-  const hd = row.holiday_date;
-  if (typeof hd === 'string') {
-    const d = hd.slice(0, 10);
-    return d >= start.slice(0, 10) && d <= end.slice(0, 10);
-  }
-  const rs = row.start_date;
-  const re = row.end_date;
-  if (typeof rs === 'string' && typeof re === 'string') {
-    const a = rs.slice(0, 10);
-    const b = re.slice(0, 10);
-    return !(b < start.slice(0, 10) || a > end.slice(0, 10));
-  }
-  return false;
+function holidaysTableHasRegionColumn(): boolean {
+  return process.env.MCP_HOLIDAYS_HAVE_REGION === 'true';
 }
+
+async function queryHolidaysForRegion(start_date: string, end_date: string, region: Region): Promise<unknown[]> {
+  const table = getHolidayTable(region);
+  if (!table) return [];
+  let q = db.from(table).select('*').gte('date', start_date).lte('date', end_date);
+  if (holidaysTableHasRegionColumn()) q = q.eq('region', region);
+  const { data, error } = await q.order('date', { ascending: true });
+  throwIfError('queryHolidaysForRegion', error);
+  return data ?? [];
+}
+
+/** Explicit Zod object so MCP JSON Schema and parsing include `region` (raw `{ mds_id, region }` shapes are normalized by the SDK). */
+const getMdsProfileInputSchema = z.object({
+  mds_id: z.string().describe('The MDS ID'),
+  region: toolRegionOptional,
+});
 
 export function registerDirectoryTools(server: McpServer): void {
   const runGetMdsProfile = instrumented(
     'integrity',
     'get_mds_profile',
-    async ({ mds_id }: { mds_id: string }) => {
+    async (input: { mds_id: string; region?: string }) => {
+      console.log('[get_mds_profile] raw input:', JSON.stringify(input));
+      const region = resolveRegion(input.region);
       const { data, error } = await db
         .from('mds_profile_info')
         .select('*')
-        .eq('mds_id', mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('mds_id', input.mds_id)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('get_mds_profile', error);
       return data;
@@ -45,8 +56,9 @@ export function registerDirectoryTools(server: McpServer): void {
   server.registerTool(
     'get_mds_profile',
     {
-      description: 'Get full profile for a single BD MDS by ID.',
-      inputSchema: { mds_id: z.string().describe('The MDS ID') },
+      description:
+        REGION_DESC_PREFIX + 'Get full MDS profile for a single MDS by ID, scoped to service_provider for the given region.',
+      inputSchema: getMdsProfileInputSchema,
     },
     async (input) => asMcpTextContent(await runGetMdsProfile(input)),
   );
@@ -61,8 +73,10 @@ export function registerDirectoryTools(server: McpServer): void {
       coverage_mds?: boolean;
       employment_status?: string;
       limit: number;
+      region?: string;
     }) => {
-      let q = db.from('mds_profile_info').select('*').eq('service_provider', BD_MDS_FILTER.service_provider);
+      const region = resolveRegion(filters.region);
+      let q = db.from('mds_profile_info').select('*').eq('service_provider', region);
       if (filters.specialty) {
         q = q.ilike('specialty_experience', `%${filters.specialty}%`);
       }
@@ -81,7 +95,8 @@ export function registerDirectoryTools(server: McpServer): void {
   server.registerTool(
     'search_mds',
     {
-      description: 'Search BD MDS directory with optional filters.',
+      description:
+        REGION_DESC_PREFIX + 'Search MDS directory with optional filters, scoped to the given region service_provider.',
       inputSchema: {
         specialty: z.string().optional(),
         is_available: z.boolean().optional(),
@@ -89,6 +104,7 @@ export function registerDirectoryTools(server: McpServer): void {
         coverage_mds: z.boolean().optional(),
         employment_status: z.string().optional(),
         limit: z.number().int().min(1).max(200).optional().default(50),
+        region: toolRegionOptional,
       },
     },
     async (input) => asMcpTextContent(await runSearchMds(input)),
@@ -97,12 +113,14 @@ export function registerDirectoryTools(server: McpServer): void {
   const runGetClinicianProfile = instrumented(
     'integrity',
     'get_clinician_profile',
-    async ({ clinician_id }: { clinician_id: string }) => {
+    async (input: { clinician_id: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
       const { data, error } = await db
         .from('clinician_profile_info')
         .select('*')
-        .eq('clinician_id', clinician_id)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN)
+        .eq('clinician_id', input.clinician_id)
+        .like('scribe_partner_site', clinicianPattern)
         .maybeSingle();
       throwIfError('get_clinician_profile', error);
       return data;
@@ -113,8 +131,10 @@ export function registerDirectoryTools(server: McpServer): void {
   server.registerTool(
     'get_clinician_profile',
     {
-      description: 'Get full clinician profile for a Bangladesh-site clinician.',
-      inputSchema: { clinician_id: z.string().describe('Clinician ID') },
+      description:
+        REGION_DESC_PREFIX +
+        'Get full clinician profile for a clinician whose site pattern matches the given MDS region.',
+      inputSchema: { clinician_id: z.string().describe('Clinician ID'), region: toolRegionOptional },
     },
     async (input) => asMcpTextContent(await runGetClinicianProfile(input)),
   );
@@ -128,8 +148,11 @@ export function registerDirectoryTools(server: McpServer): void {
       ehr_system?: string;
       is_ramp_up?: boolean;
       limit: number;
+      region?: string;
     }) => {
-      let q = db.from('clinician_profile_info').select('*').like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN);
+      const region = resolveRegion(filters.region);
+      const clinicianPattern = getClinicianSitePattern(region);
+      let q = db.from('clinician_profile_info').select('*').like('scribe_partner_site', clinicianPattern);
       if (filters.specialty) q = q.ilike('specialty', `%${filters.specialty}%`);
       if (filters.product_line) q = q.ilike('product_line', `%${filters.product_line}%`);
       if (filters.ehr_system) q = q.ilike('ehr_system', `%${filters.ehr_system}%`);
@@ -145,35 +168,84 @@ export function registerDirectoryTools(server: McpServer): void {
   server.registerTool(
     'search_clinicians',
     {
-      description: 'Search Bangladesh-site clinicians with optional filters.',
+      description:
+        REGION_DESC_PREFIX +
+        'Search clinicians whose scribe_partner_site matches the given MDS region pattern.',
       inputSchema: {
         specialty: z.string().optional(),
         product_line: z.string().optional(),
         ehr_system: z.string().optional(),
         is_ramp_up: z.boolean().optional(),
         limit: z.number().int().min(1).max(200).optional().default(50),
+        region: toolRegionOptional,
       },
     },
     async (input) => asMcpTextContent(await runSearchClinicians(input)),
   );
 
+  const runGetRegionalHolidays = instrumented(
+    'integrity',
+    'get_regional_holidays',
+    async (input: { start_date: string; end_date: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      return queryHolidaysForRegion(input.start_date, input.end_date, region);
+    },
+    (out) => ({ count: Array.isArray(out) ? out.length : 0 }),
+  );
+
+  server.registerTool(
+    'get_regional_holidays',
+    {
+      description:
+        REGION_DESC_PREFIX +
+        'List holidays for an MCP region in a date range (bd_holidays vs in_holidays). When MCP_HOLIDAYS_HAVE_REGION=true, filters by holidays.region. Returns [] when the region has no holiday table.',
+      inputSchema: {
+        start_date: z.string(),
+        end_date: z.string(),
+        region: toolRegionOptional,
+      },
+    },
+    async (input) => asMcpTextContent(await runGetRegionalHolidays(input)),
+  );
+
+  const runGetHolidays = instrumented(
+    'integrity',
+    'get_holidays',
+    async (input: { start_date: string; end_date: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      return queryHolidaysForRegion(input.start_date, input.end_date, region);
+    },
+    (out) => ({ count: Array.isArray(out) ? out.length : 0 }),
+  );
+
+  server.registerTool(
+    'get_holidays',
+    {
+      description:
+        REGION_DESC_PREFIX +
+        'Same behavior as get_regional_holidays. Prefer get_regional_holidays for new integrations.',
+      inputSchema: {
+        start_date: z.string(),
+        end_date: z.string(),
+        region: toolRegionOptional,
+      },
+    },
+    async (input) => asMcpTextContent(await runGetHolidays(input)),
+  );
+
   const runGetBdHolidays = instrumented(
     'integrity',
     'get_bd_holidays',
-    async ({ start_date, end_date }: { start_date: string; end_date: string }) => {
-      const { data, error } = await db.from('bd_holidays').select('*').limit(5000);
-      throwIfError('get_bd_holidays', error);
-      const rows = (data ?? []).filter((r) => holidayInRange(r as Record<string, unknown>, start_date, end_date));
-      console.log('[directory.get_bd_holidays] rowCount=%d', rows.length);
-      return rows;
-    },
-    (out) => ({ rowCount: (out as unknown[]).length }),
+    async (input: { start_date: string; end_date: string }) =>
+      queryHolidaysForRegion(input.start_date, input.end_date, BD_HOLIDAY_REGION),
+    (out) => ({ count: Array.isArray(out) ? out.length : 0 }),
   );
 
   server.registerTool(
     'get_bd_holidays',
     {
-      description: 'List Bangladesh holidays overlapping a date range.',
+      description:
+        '[DEPRECATED] Alias for get_regional_holidays with region locked to AX-BD-Dhaka. Prefer get_regional_holidays.',
       inputSchema: {
         start_date: z.string().describe('Range start yyyy-mm-dd'),
         end_date: z.string().describe('Range end yyyy-mm-dd'),
@@ -185,7 +257,8 @@ export function registerDirectoryTools(server: McpServer): void {
   const runGetLeaveEntitlements = instrumented(
     'integrity',
     'get_leave_entitlements',
-    async ({ leave_type }: { leave_type?: string }) => {
+    async ({ leave_type, region }: { leave_type?: string; region?: string }) => {
+      resolveRegion(region);
       let q = db.from('leave_entitlements').select('*');
       if (leave_type) q = q.eq('leave_type', leave_type);
       const { data, error } = await q.limit(500);
@@ -199,8 +272,10 @@ export function registerDirectoryTools(server: McpServer): void {
   server.registerTool(
     'get_leave_entitlements',
     {
-      description: 'List leave entitlement rows, optionally filtered by leave type.',
-      inputSchema: { leave_type: z.string().optional() },
+      description:
+        REGION_DESC_PREFIX +
+        'List leave entitlement rows, optionally filtered by leave type. `region` is accepted for schema consistency only.',
+      inputSchema: { leave_type: z.string().optional(), region: toolRegionOptional },
     },
     async (input) => asMcpTextContent(await runGetLeaveEntitlements(input)),
   );
