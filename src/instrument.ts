@@ -59,8 +59,22 @@ export function instrumented<TIn, TOut>(
         .from('agent_runs')
         .insert(row)
         .then(
-          () => {},
-          () => {},
+          ({ error }) => {
+            if (error) {
+              console.error('[instrument] agent_runs write failed:', {
+                tool: toolName,
+                code: error.code,
+                message: error.message,
+                hint: error.hint,
+              });
+            }
+          },
+          (err) => {
+            console.error(
+              '[instrument] agent_runs write threw:',
+              (err as { message?: string } | null | undefined)?.message ?? err,
+            );
+          },
         );
     }
   };
