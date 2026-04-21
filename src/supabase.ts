@@ -1,11 +1,28 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { createClient } from '@supabase/supabase-js';
 
-/**
- * Service-role Supabase client. Instantiate once at process startup after env validation.
- * Never send the service role key or raw credentials in MCP tool responses.
- */
-export function createSupabase(url: string, serviceRoleKey: string): SupabaseClient {
-  return createClient(url, serviceRoleKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+const opts = {
+  auth: { persistSession: false, autoRefreshToken: false },
+} as const;
+
+function requireEnv(name: string): string {
+  const v = process.env[name]?.trim();
+  if (!v) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return v;
 }
+
+const supabaseUrl = requireEnv('SUPABASE_URL');
+const supabaseServiceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
+
+/** Production `public` schema (MDS/clinician/ARGUS/NEMESIS tables). */
+export const db = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  ...opts,
+  db: { schema: 'public' },
+});
+
+/** Observability `mcp` schema (`agent_runs`, `audit_log`). */
+export const mcpDb = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  ...opts,
+  db: { schema: 'mcp' },
+});

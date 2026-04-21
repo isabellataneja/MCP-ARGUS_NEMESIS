@@ -5,9 +5,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 import { requireBearer } from './auth.js';
-import { createSupabase } from './supabase.js';
-import { registerArgusTools } from './tools/argus.js';
-import { registerNemesisTools } from './tools/nemesis.js';
+import { requestAgentStore } from './context.js';
+import { registerAllTools } from './register.js';
 
 function requireEnv(name: string): string {
   const v = process.env[name]?.trim();
@@ -18,18 +17,13 @@ function requireEnv(name: string): string {
 }
 
 function loadConfig() {
-  const supabaseUrl = requireEnv('SUPABASE_URL');
-  const supabaseServiceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
   requireEnv('MCP_BEARER_TOKEN');
-
   return {
-    supabaseUrl,
-    supabaseServiceRoleKey,
     port: Number(process.env.PORT) || 8080,
   };
 }
 
-function createMcpServer(supabase: ReturnType<typeof createSupabase>): McpServer {
+function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: 'nemesis-argus-bridge',
@@ -37,18 +31,16 @@ function createMcpServer(supabase: ReturnType<typeof createSupabase>): McpServer
     },
     {
       instructions:
-        'Remote MCP bridge for NEMESIS (MDS pairing) and ARGUS (leave prediction). All MDS workforce queries are restricted to Bangladesh (country_code=BD) at the database layer.',
+        'Remote MCP bridge for NEMESIS (MDS pairing) and ARGUS (coverage / leave). Bangladesh scope: MDS rows use service_provider AX-BD-Dhaka; clinician rows use scribe_partner_site AX-BD-%. Never rely on clients for these filters.',
     },
   );
-  registerNemesisTools(server, supabase);
-  registerArgusTools(server, supabase);
+  registerAllTools(server);
   return server;
 }
 
 function main() {
   const config = loadConfig();
 
-  const supabase = createSupabase(config.supabaseUrl, config.supabaseServiceRoleKey);
   const app = express();
   app.use(express.json());
 
@@ -62,30 +54,35 @@ function main() {
   // app.post('/mcp', mcpRateLimiter, requireBearer, handler);
 
   app.post('/mcp', requireBearer, async (req, res) => {
-    const server = createMcpServer(supabase);
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
+    const raw = req.headers['x-agent-name'];
+    const agentName = typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : null;
 
-    try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-      res.on('close', () => {
-        void transport.close();
-        void server.close();
+    await requestAgentStore.run({ agentName }, async () => {
+      const server = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
       });
-    } catch (err) {
-      console.error('[mcp] request_failed type=%s', err instanceof Error ? err.name : typeof err);
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: '2.0',
-          error: { code: -32603, message: 'Internal server error' },
-          id: null,
+
+      try {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+        res.on('close', () => {
+          void transport.close();
+          void server.close();
         });
+      } catch (err) {
+        console.error('[mcp] request_failed type=%s', err instanceof Error ? err.name : typeof err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: null,
+          });
+        }
+        await transport.close().catch(() => {});
+        await server.close().catch(() => {});
       }
-      await transport.close().catch(() => {});
-      await server.close().catch(() => {});
-    }
+    });
   });
 
   app.listen(config.port, '0.0.0.0', () => {
