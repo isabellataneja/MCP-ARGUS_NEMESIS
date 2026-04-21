@@ -49,11 +49,11 @@ export function instrumented<TIn, TOut>(
         agent,
         tool_name: toolName,
         input_shape: describeShape(input),
-        output_summary: success && output !== undefined ? summarize(output) : {},
+        output_summary: success && output ? summarize(output) : {},
         success,
         error_message: errorMessage,
         latency_ms: Date.now() - started,
-        caller,
+        caller: caller ?? null,
       };
       void mcpDb
         .from('agent_runs')
@@ -66,13 +66,14 @@ export function instrumented<TIn, TOut>(
                 code: error.code,
                 message: error.message,
                 hint: error.hint,
+                details: error.details,
               });
             }
           },
           (err) => {
             console.error(
               '[instrument] agent_runs write threw:',
-              (err as { message?: string } | null | undefined)?.message ?? err,
+              (err as { message?: string } | undefined)?.message ?? String(err),
             );
           },
         );
