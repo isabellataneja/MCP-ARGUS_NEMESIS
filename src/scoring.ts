@@ -1,3 +1,5 @@
+import type { Region } from './filters.js';
+
 export type ClinicianShape = {
   specialty: string | null;
   ehr_system: string | null;
@@ -47,8 +49,14 @@ function ilikeMatch(hay: string | null | undefined, needle: string | null | unde
 
 /**
  * Shared NEMESIS-style score (0–1-ish composite). Used by `rank_mds_candidates` and `find_backup_candidates`.
+ * `region` is reserved for future market-specific scoring; logic remains region-agnostic today.
  */
-export function scoreMdsForClinician(mds: MdsCandidateShape, clinician: ClinicianShape): { score: number; components: ScoreComponents; flags: string[] } {
+export function scoreMdsForClinician(
+  mds: MdsCandidateShape,
+  clinician: ClinicianShape,
+  _region?: Region,
+): { score: number; components: ScoreComponents; flags: string[] } {
+  void _region;
   const flags: string[] = [];
   const wSla = 0.3;
   const wRet = 0.2;

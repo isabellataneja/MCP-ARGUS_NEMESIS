@@ -1,6 +1,7 @@
 import { computeLeaveProbability } from './leaveHeuristics.js';
+import type { Region } from './filters.js';
+import { DEFAULT_REGION } from './filters.js';
 import { db } from './supabase.js';
-import { BD_MDS_FILTER } from './filters.js';
 
 export type MdsAvailabilityReport = {
   mds_id: string;
@@ -28,11 +29,12 @@ function resigningStatus(hr: string | null | undefined): boolean {
 
 /**
  * Batch-loads profile, availability row, forecast, and heuristic leave probability per MDS.
- * BD scope enforced on `mds_profile_info` reads.
+ * MDS rows are restricted to `service_provider = region`.
  */
 export async function buildMdsAvailabilityReports(
   mdsIds: string[],
   targetDate: string,
+  region: Region = DEFAULT_REGION,
 ): Promise<Record<string, MdsAvailabilityReport>> {
   const uniq = [...new Set(mdsIds)];
   const out: Record<string, MdsAvailabilityReport> = {};
@@ -44,7 +46,7 @@ export async function buildMdsAvailabilityReports(
       'mds_id,is_available,employment_status,hr_employee_status,hot_list,open_remediation_p1_p2,active_p3_remediation',
     )
     .in('mds_id', uniq)
-    .eq('service_provider', BD_MDS_FILTER.service_provider);
+    .eq('service_provider', region);
   if (pErr) throw new Error(pErr.message);
 
   const { data: availRows, error: aErr } = await db
@@ -84,7 +86,7 @@ export async function buildMdsAvailabilityReports(
 
     const blockers: string[] = [];
     if (!profile) {
-      blockers.push('not_bd_mds');
+      blockers.push('not_in_region_mds');
       out[mdsId] = {
         mds_id: mdsId,
         is_available: false,
@@ -119,7 +121,7 @@ export async function buildMdsAvailabilityReports(
 
     let leave_probability: number | null = null;
     try {
-      const lp = await computeLeaveProbability(mdsId, targetDate);
+      const lp = await computeLeaveProbability(mdsId, targetDate, region);
       leave_probability = lp.leave_probability;
       if (leave_probability >= 0.65) blockers.push('high_leave_risk');
     } catch {

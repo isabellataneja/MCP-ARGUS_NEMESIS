@@ -31,7 +31,7 @@ function createMcpServer(): McpServer {
     },
     {
       instructions:
-        'Remote MCP bridge for NEMESIS (MDS pairing) and ARGUS (coverage / leave). Bangladesh scope: MDS rows use service_provider AX-BD-Dhaka; clinician rows use scribe_partner_site AX-BD-%. Never rely on clients for these filters.',
+        'Remote MCP bridge for NEMESIS (MDS pairing) and ARGUS (coverage / leave). Tools scope MDS rows by service_provider and clinicians by derived scribe_partner_site pattern; optional `region` on each tool (default MCP_DEFAULT_REGION). Invalid explicit `region` values throw. Holiday listing uses get_regional_holidays; get_bd_holidays is a BD-only alias. Set MCP_HOLIDAYS_HAVE_REGION=true after adding holidays.region in SQL. Use get_mds_profile with the correct region for pairing flows.',
     },
   );
   registerAllTools(server);

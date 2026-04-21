@@ -1,18 +1,26 @@
 import { db } from './supabase.js';
-import { BD_MDS_FILTER } from './filters.js';
+import type { Region } from './filters.js';
+import { DEFAULT_REGION } from './filters.js';
+import { getHolidayTable } from './holidays.js';
 
 /** 0=Sun … 4=Thu — tunable later via env-driven metadata if needed. */
 const DEFAULT_HIGH_LEAVE_DOW = 4;
+
+function holidaysTableHasRegionColumn(): boolean {
+  return process.env.MCP_HOLIDAYS_HAVE_REGION === 'true';
+}
 
 export type LeaveFactor = { factor: string; contribution: number };
 
 /**
  * Heuristic leave probability (0–1). Real model can replace internals later.
- * Uses last `daysBack` days of `argus_leave_entries` for the MDS (BD-scoped).
+ * Uses last `daysBack` days of `argus_leave_entries` for the MDS scoped to `region`.
+ * Holiday +0.2 boost uses the region's holiday table when configured.
  */
 export async function computeLeaveProbability(
   mdsId: string,
   targetDate: string,
+  region: Region = DEFAULT_REGION,
   daysBack = 180,
 ): Promise<{ leave_probability: number; top_factors: LeaveFactor[] }> {
   const since = new Date();
@@ -23,11 +31,11 @@ export async function computeLeaveProbability(
     .from('mds_profile_info')
     .select('mds_id')
     .eq('mds_id', mdsId)
-    .eq('service_provider', BD_MDS_FILTER.service_provider)
+    .eq('service_provider', region)
     .maybeSingle();
   if (mdsErr) throw new Error(mdsErr.message);
   if (!mdsRow) {
-    return { leave_probability: 0, top_factors: [{ factor: 'mds_not_bd_scope', contribution: 0 }] };
+    return { leave_probability: 0, top_factors: [{ factor: 'mds_not_in_region_scope', contribution: 0 }] };
   }
 
   const { data: leaves, error: leaveErr } = await db
@@ -44,11 +52,17 @@ export async function computeLeaveProbability(
   const factors: LeaveFactor[] = [{ factor: 'historical_base_rate', contribution: baseRate }];
 
   const prev = addDaysIso(targetDate, -1);
-  const { data: holRows, error: holErr } = await db.from('bd_holidays').select('*').limit(2000);
-  if (holErr) throw new Error(holErr.message);
-  const afterHoliday = (holRows ?? []).some((row) => holidayRowCoversDate(row as Record<string, unknown>, prev));
+  const holidayTable = getHolidayTable(region);
+  let afterHoliday = false;
+  if (holidayTable) {
+    let q = db.from(holidayTable).select('date').eq('date', prev).limit(1);
+    if (holidaysTableHasRegionColumn()) q = q.eq('region', region);
+    const { data: holHit, error: holErr } = await q;
+    if (holErr) throw new Error(holErr.message);
+    afterHoliday = (holHit ?? []).length > 0;
+  }
   if (afterHoliday) {
-    factors.push({ factor: 'day_after_bd_holiday', contribution: 0.2 });
+    factors.push({ factor: 'day_after_regional_holiday', contribution: 0.2 });
   }
 
   const dow = isoWeekdayUtc(targetDate);
@@ -82,17 +96,4 @@ function addDaysIso(isoDate: string, delta: number): string {
 
 function isoWeekdayUtc(isoDate: string): number {
   return new Date(`${isoDate}T12:00:00.000Z`).getUTCDay();
-}
-
-function holidayRowCoversDate(row: Record<string, unknown>, d: string): boolean {
-  const hd = row.holiday_date;
-  if (typeof hd === 'string' && hd.slice(0, 10) === d) return true;
-  const s = row.start_date;
-  const e = row.end_date;
-  if (typeof s === 'string' && typeof e === 'string') {
-    const ss = s.slice(0, 10);
-    const ee = e.slice(0, 10);
-    return d >= ss && d <= ee;
-  }
-  return false;
 }
