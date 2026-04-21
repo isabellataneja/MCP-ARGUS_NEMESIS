@@ -4,10 +4,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { buildMdsAvailabilityReports } from '../availabilityBatch.js';
-import { BD_CLINICIAN_SITE_PATTERN, BD_MDS_FILTER } from '../filters.js';
+import { getClinicianSitePattern, resolveRegion, toolInputSchema, toolRegionOptional } from '../filters.js';
 import { asMcpTextContent, instrumented } from '../instrument.js';
 import { db } from '../supabase.js';
 import { isActiveEmployment, scoreMdsForClinician, type MdsCandidateShape, type RankedMds } from '../scoring.js';
+
+const REGION_DESC_PREFIX = 'Region-scoped. Defaults to AX-BD-Dhaka if region not passed. ';
 
 function throwIfError(context: string, error: { message: string } | null) {
   if (error) throw new Error(`${context}: ${error.message}`);
@@ -17,9 +19,10 @@ export function registerOrchestrationTools(server: McpServer): void {
   const runCheckMdsListAvailability = instrumented(
     'forecaster',
     'check_mds_list_availability',
-    async ({ mds_ids, target_date }: { mds_ids: string[]; target_date: string }) => {
-      const reports = await buildMdsAvailabilityReports(mds_ids, target_date);
-      const list = mds_ids.map((id) => reports[id]);
+    async (input: { mds_ids: string[]; target_date: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const reports = await buildMdsAvailabilityReports(input.mds_ids, input.target_date, region);
+      const list = input.mds_ids.map((id) => reports[id]);
       console.log('[orchestration.check_mds_list_availability] resultCount=%d', list.length);
       return list;
     },
@@ -29,11 +32,14 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.registerTool(
     'check_mds_list_availability',
     {
-      description: 'Batch vet MDS candidates for a target date (availability, forecast, leave heuristic, blockers).',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Batch vet MDS candidates for a target date; each MDS must match the given region service_provider.',
+      inputSchema: toolInputSchema({
         mds_ids: z.array(z.string()).min(1).max(200),
         target_date: z.string(),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runCheckMdsListAvailability(input)),
   );
@@ -46,17 +52,20 @@ export function registerOrchestrationTools(server: McpServer): void {
       target_date: string;
       top_n: number;
       exclude_mds_ids: string[];
+      region?: string;
     }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
       const { clinician_id, target_date, top_n, exclude_mds_ids } = input;
 
       const { data: clinician, error: cErr } = await db
         .from('clinician_profile_info')
         .select('clinician_id,specialty,ehr_system,scribe_partner_site')
         .eq('clinician_id', clinician_id)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN)
+        .like('scribe_partner_site', clinicianPattern)
         .maybeSingle();
       throwIfError('find_backup_candidates.clinician', cErr);
-      if (!clinician) throw new Error('clinician_not_found_or_not_bd_scope');
+      if (!clinician) throw new Error('clinician_not_found_or_not_region_scope');
 
       const exclude = new Set(exclude_mds_ids ?? []);
       const { data: candidates, error: mErr } = await db
@@ -64,7 +73,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         .select(
           'mds_id,mds_name,specialty_experience,active_ehrs,sla_met_pct,ai_mds_retention_pct,avg_overall_review,hot_list,open_escalations,open_remediation_p1_p2,active_p3_remediation,employment_status,is_available',
         )
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .eq('is_available', true)
         .limit(800);
       throwIfError('find_backup_candidates.mds', mErr);
@@ -75,7 +84,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         .filter((m) => isActiveEmployment(m.employment_status ?? null));
 
       const ids = pool.map((m) => m.mds_id);
-      const reports = await buildMdsAvailabilityReports(ids, target_date);
+      const reports = await buildMdsAvailabilityReports(ids, target_date, region);
       const blockerFree = pool.filter((m) => (reports[m.mds_id]?.blockers?.length ?? 99) === 0);
 
       const clinShape = {
@@ -85,7 +94,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
       const ranked: RankedMds[] = [];
       for (const m of blockerFree) {
-        const { score, components, flags } = scoreMdsForClinician(m, clinShape);
+        const { score, components, flags } = scoreMdsForClinician(m, clinShape, region);
         ranked.push({
           mds_id: m.mds_id,
           mds_name: m.mds_name,
@@ -106,13 +115,16 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.registerTool(
     'find_backup_candidates',
     {
-      description: 'Rank BD MDS backups that are blocker-free on a target date (ARGUS companion to NEMESIS ranking).',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Rank MDS backups that are blocker-free on a target date within the given region.',
+      inputSchema: toolInputSchema({
         clinician_id: z.string(),
         target_date: z.string(),
         top_n: z.number().int().min(1).max(50).optional().default(10),
         exclude_mds_ids: z.array(z.string()).optional().default([]),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runFindBackupCandidates(input)),
   );
@@ -120,12 +132,15 @@ export function registerOrchestrationTools(server: McpServer): void {
   const runGetCliniciansAffectedByMdsAbsence = instrumented(
     'forecaster',
     'get_clinicians_affected_by_mds_absence',
-    async ({ mds_id, date }: { mds_id: string; date: string }) => {
+    async (input: { mds_id: string; date: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
+      const { mds_id, date } = input;
       const { data: mdsRow, error: mErr } = await db
         .from('mds_profile_info')
         .select('mds_id')
         .eq('mds_id', mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('get_clinicians_affected_by_mds_absence.mds', mErr);
       if (!mdsRow) return [];
@@ -143,6 +158,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         if (toRaw === null || toRaw === undefined || String(toRaw).trim() === '') return true;
         return String(toRaw).slice(0, 10) >= date;
       });
+      // shift_start_time lives on clinician_mds_pairings, not clinician_profile_info
       const shiftByClinician = new Map<string, string | null>();
       for (const r of active) {
         const cid = String((r as { clinician_id: string }).clinician_id);
@@ -160,7 +176,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         .from('clinician_profile_info')
         .select('clinician_id,clinician_name,product_line,ehr_system,specialty,sla_target_min,scribe_partner_site')
         .in('clinician_id', ids)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN);
+        .like('scribe_partner_site', clinicianPattern);
       throwIfError('get_clinicians_affected_by_mds_absence.clinicians', cErr);
       const rows =
         clinicians?.map((c) => {
@@ -184,8 +200,14 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.registerTool(
     'get_clinicians_affected_by_mds_absence',
     {
-      description: 'List Bangladesh clinicians paired to an MDS on a given date (active pairing window).',
-      inputSchema: { mds_id: z.string(), date: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'List clinicians paired to an MDS on a given date (active pairing window), scoped to the region site pattern.',
+      inputSchema: toolInputSchema({
+        mds_id: z.string(),
+        date: z.string(),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetCliniciansAffectedByMdsAbsence(input)),
   );
@@ -201,37 +223,40 @@ export function registerOrchestrationTools(server: McpServer): void {
       confidence_score: number;
       original_mds_id: string;
       gap_id?: string;
+      region?: string;
     }) => {
       void input.rationale;
       void input.confidence_score;
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
       const plan_id = randomUUID();
 
       const { data: clin, error: cErr } = await db
         .from('clinician_profile_info')
         .select('clinician_id,clinician_name')
         .eq('clinician_id', input.clinician_id)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN)
+        .like('scribe_partner_site', clinicianPattern)
         .maybeSingle();
       throwIfError('propose_backup_pairing.clinician', cErr);
-      if (!clin) throw new Error('clinician_not_bd_scope');
+      if (!clin) throw new Error('clinician_not_region_scope');
 
       const { data: primaryMds, error: pErr } = await db
         .from('mds_profile_info')
         .select('mds_id,mds_name')
         .eq('mds_id', input.original_mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('propose_backup_pairing.primary_mds', pErr);
-      if (!primaryMds) throw new Error('primary_mds_not_bd_scope');
+      if (!primaryMds) throw new Error('primary_mds_not_region_scope');
 
       const { data: backupMds, error: bErr } = await db
         .from('mds_profile_info')
         .select('mds_id,mds_name')
         .eq('mds_id', input.backup_mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('propose_backup_pairing.backup_mds', bErr);
-      if (!backupMds) throw new Error('backup_mds_not_bd_scope');
+      if (!backupMds) throw new Error('backup_mds_not_region_scope');
 
       const row = {
         plan_id,
@@ -265,8 +290,10 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.registerTool(
     'propose_backup_pairing',
     {
-      description: 'Insert a daily_coverage_plan backup row and optionally resolve a coverage gap by id.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Insert a daily_coverage_plan backup row and optionally resolve a coverage gap by id. All lookups respect the resolved region.',
+      inputSchema: toolInputSchema({
         clinician_id: z.string(),
         backup_mds_id: z.string(),
         date: z.string(),
@@ -274,7 +301,8 @@ export function registerOrchestrationTools(server: McpServer): void {
         confidence_score: z.number().min(0).max(1),
         original_mds_id: z.string(),
         gap_id: z.string().optional(),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runProposeBackupPairing(input)),
   );

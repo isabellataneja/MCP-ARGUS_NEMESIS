@@ -4,15 +4,18 @@ import { mcpDb } from './supabase.js';
 export type AgentKind = 'nemesis' | 'argus' | 'forecaster' | 'integrity';
 
 /**
- * Per-field value kinds for `agent_runs.input_shape`. No key whitelist — every
- * enumerable own property on `input` is recorded. `_keys` lists which keys were
- * present after MCP/Zod validation (optional fields omitted from the object do not appear).
+ * Per-field value kinds for `agent_runs.input_shape`. No key whitelist.
+ * `input` is the same object reference passed to the tool handler (i.e. MCP
+ * `validateToolInput` / Zod output). We walk **all own keys** via `Reflect.ownKeys`
+ * (string keys; symbol keys skipped for JSON-safe column storage).
  */
 function describeShape(input: unknown): Record<string, string> {
   if (input === null || input === undefined) return { _keys: '' };
   if (typeof input !== 'object') return { _keys: '', _nonObject: typeof input };
   const obj = input as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
+  const keys = Reflect.ownKeys(obj)
+    .filter((k): k is string => typeof k === 'string')
+    .sort();
   const out: Record<string, string> = { _keys: keys.join(',') };
   for (const k of keys) {
     const v = obj[k];
@@ -65,11 +68,6 @@ export function instrumented<TIn, TOut>(
         latency_ms: Date.now() - started,
         caller: caller ?? null,
       };
-      console.log('[instrument] call', {
-        tool: toolName,
-        inputKeys: Object.keys((input as object) ?? {}),
-        input,
-      });
       void mcpDb
         .from('agent_runs')
         .insert(row)

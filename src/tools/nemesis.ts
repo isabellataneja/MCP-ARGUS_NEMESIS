@@ -3,7 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import { BD_CLINICIAN_SITE_PATTERN, BD_MDS_FILTER } from '../filters.js';
+import {
+  getClinicianSitePattern,
+  resolveRegion,
+  toolInputSchema,
+  toolRegionOptional,
+  type Region,
+} from '../filters.js';
 import { asMcpTextContent, instrumented } from '../instrument.js';
 import { mcpDb } from '../supabase.js';
 import { db } from '../supabase.js';
@@ -13,13 +19,15 @@ function throwIfError(context: string, error: { message: string } | null) {
   if (error) throw new Error(`${context}: ${error.message}`);
 }
 
+const REGION_DESC_PREFIX = 'Region-scoped. Defaults to AX-BD-Dhaka if region not passed. ';
+
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function bdMdsIdSet(): Promise<Set<string>> {
-  const { data, error } = await db.from('mds_profile_info').select('mds_id').eq('service_provider', BD_MDS_FILTER.service_provider);
-  throwIfError('bdMdsIdSet', error);
+async function mdsIdSetForRegion(region: Region): Promise<Set<string>> {
+  const { data, error } = await db.from('mds_profile_info').select('mds_id').eq('service_provider', region);
+  throwIfError('mdsIdSetForRegion', error);
   return new Set((data ?? []).map((r) => String((r as { mds_id: string }).mds_id)));
 }
 
@@ -27,12 +35,26 @@ export function registerNemesisTools(server: McpServer): void {
   const runGetCurrentPairing = instrumented(
     'nemesis',
     'get_current_pairing',
-    async ({ clinician_id }: { clinician_id: string }) => {
+    async (input: { clinician_id: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
+      const { data: clinRow, error: clinErr } = await db
+        .from('clinician_profile_info')
+        .select('clinician_id')
+        .eq('clinician_id', input.clinician_id)
+        .like('scribe_partner_site', clinicianPattern)
+        .maybeSingle();
+      throwIfError('get_current_pairing.clinician', clinErr);
+      if (!clinRow) {
+        console.log('[nemesis.get_current_pairing] rowCount=0');
+        return { primary_mds_id: null as string | null, row: null };
+      }
+
       const today = todayIso();
       const { data, error } = await db
         .from('clinician_mds_pairings')
         .select('clinician_id,primary_mds_id,active,effective_from,effective_to')
-        .eq('clinician_id', clinician_id)
+        .eq('clinician_id', input.clinician_id)
         .eq('active', true);
       throwIfError('get_current_pairing', error);
       const rows = (data ?? []).filter((r) => {
@@ -54,8 +76,10 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'get_current_pairing',
     {
-      description: 'Return the active primary MDS pairing for a clinician (text date-safe filters).',
-      inputSchema: { clinician_id: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'Return the active primary MDS pairing for a clinician (text date-safe filters). Clinician must match the resolved region site pattern.',
+      inputSchema: toolInputSchema({ clinician_id: z.string(), region: toolRegionOptional }),
     },
     async (input) => asMcpTextContent(await runGetCurrentPairing(input)),
   );
@@ -63,11 +87,25 @@ export function registerNemesisTools(server: McpServer): void {
   const runGetMdsPairedClinicians = instrumented(
     'nemesis',
     'get_mds_paired_clinicians',
-    async ({ mds_id }: { mds_id: string }) => {
+    async (input: { mds_id: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
+      const { data: mdsOk, error: mErr } = await db
+        .from('mds_profile_info')
+        .select('mds_id')
+        .eq('mds_id', input.mds_id)
+        .eq('service_provider', region)
+        .maybeSingle();
+      throwIfError('get_mds_paired_clinicians.mds', mErr);
+      if (!mdsOk) {
+        console.log('[nemesis.get_mds_paired_clinicians] rowCount=0');
+        return [];
+      }
+
       const { data: pairs, error: pErr } = await db
         .from('clinician_mds_pairings')
         .select('clinician_id,primary_mds_id,active,effective_from,effective_to')
-        .eq('primary_mds_id', mds_id)
+        .eq('primary_mds_id', input.mds_id)
         .eq('active', true);
       throwIfError('get_mds_paired_clinicians.pairings', pErr);
       const ids = [...new Set((pairs ?? []).map((r) => String((r as { clinician_id: string }).clinician_id)))];
@@ -79,7 +117,7 @@ export function registerNemesisTools(server: McpServer): void {
         .from('clinician_profile_info')
         .select('clinician_id,scribe_partner_site')
         .in('clinician_id', ids)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN);
+        .like('scribe_partner_site', clinicianPattern);
       throwIfError('get_mds_paired_clinicians.clinicians', cErr);
       const allowed = new Set((clinicians ?? []).map((c) => String((c as { clinician_id: string }).clinician_id)));
       const filtered = (pairs ?? []).filter((r) => allowed.has(String((r as { clinician_id: string }).clinician_id)));
@@ -92,8 +130,10 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'get_mds_paired_clinicians',
     {
-      description: 'List active pairings for an MDS, restricted to Bangladesh-site clinicians.',
-      inputSchema: { mds_id: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'List active pairings for an MDS, restricted to clinicians matching the region site pattern. MDS must be in the same region.',
+      inputSchema: toolInputSchema({ mds_id: z.string(), region: toolRegionOptional }),
     },
     async (input) => asMcpTextContent(await runGetMdsPairedClinicians(input)),
   );
@@ -106,8 +146,10 @@ export function registerNemesisTools(server: McpServer): void {
       mds_id?: string;
       window_days: number;
       limit: number;
+      region?: string;
     }) => {
-      const bd = await bdMdsIdSet();
+      const region = resolveRegion(filters.region);
+      const scope = await mdsIdSetForRegion(region);
       let q = db.from('pairing_history').select('*');
       if (filters.clinician_id) q = q.eq('clinician_id', filters.clinician_id);
       if (filters.mds_id) q = q.eq('mds_id', filters.mds_id);
@@ -117,7 +159,7 @@ export function registerNemesisTools(server: McpServer): void {
       cut.setUTCDate(cut.getUTCDate() - filters.window_days);
       const cutStr = cut.toISOString().slice(0, 10);
       const rows = (data ?? [])
-        .filter((r) => bd.has(String((r as { mds_id: string }).mds_id)))
+        .filter((r) => scope.has(String((r as { mds_id: string }).mds_id)))
         .filter((r) => {
           const rd = String((r as { recommendation_date?: string }).recommendation_date ?? '').slice(0, 10);
           return rd.length === 0 || rd >= cutStr;
@@ -137,13 +179,16 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'get_pairing_history',
     {
-      description: 'Pairing history scoped to BD MDS rows, ordered by recommendation_date descending.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Pairing history scoped to MDS rows in the given region, ordered by recommendation_date descending.',
+      inputSchema: toolInputSchema({
         clinician_id: z.string().optional(),
         mds_id: z.string().optional(),
         window_days: z.number().int().min(1).max(730).optional().default(180),
         limit: z.number().int().min(1).max(500).optional().default(100),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetPairingHistory(input)),
   );
@@ -151,12 +196,14 @@ export function registerNemesisTools(server: McpServer): void {
   const runGetMdsPerformanceSummary = instrumented(
     'nemesis',
     'get_mds_performance_summary',
-    async ({ mds_id, window_days }: { mds_id: string; window_days: number }) => {
+    async (input: { mds_id: string; window_days: number; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const { mds_id, window_days } = input;
       const { data: mds, error: mErr } = await db
         .from('mds_profile_info')
         .select('mds_id')
         .eq('mds_id', mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('get_mds_performance_summary.mds', mErr);
       if (!mds) return null;
@@ -215,11 +262,14 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'get_mds_performance_summary',
     {
-      description: 'Aggregate NEMESIS note metrics for a BD MDS over a rolling window.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Aggregate NEMESIS note metrics for an MDS in the given region over a rolling window.',
+      inputSchema: toolInputSchema({
         mds_id: z.string(),
         window_days: z.number().int().min(7).max(365).optional().default(90),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetMdsPerformanceSummary(input)),
   );
@@ -232,23 +282,26 @@ export function registerNemesisTools(server: McpServer): void {
       shift_date: string;
       top_n: number;
       exclude_mds_ids: string[];
+      region?: string;
     }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
       const { clinician_id, shift_date, top_n, exclude_mds_ids } = input;
       const { data: clinician, error: cErr } = await db
         .from('clinician_profile_info')
         .select('clinician_id,specialty,ehr_system,scribe_partner_site')
         .eq('clinician_id', clinician_id)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN)
+        .like('scribe_partner_site', clinicianPattern)
         .maybeSingle();
       throwIfError('rank_mds_candidates.clinician', cErr);
-      if (!clinician) throw new Error('clinician_not_found_or_not_bd_scope');
+      if (!clinician) throw new Error('clinician_not_found_or_not_region_scope');
 
       const { data: candidates, error: mErr } = await db
         .from('mds_profile_info')
         .select(
           'mds_id,mds_name,specialty_experience,active_ehrs,sla_met_pct,ai_mds_retention_pct,avg_overall_review,hot_list,open_escalations,open_remediation_p1_p2,active_p3_remediation,employment_status,is_available',
         )
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .eq('is_available', true)
         .limit(800);
       throwIfError('rank_mds_candidates.mds', mErr);
@@ -264,7 +317,7 @@ export function registerNemesisTools(server: McpServer): void {
         const m = raw as MdsCandidateShape & { employment_status?: string | null };
         if (exclude.has(m.mds_id)) continue;
         if (!isActiveEmployment(m.employment_status ?? null)) continue;
-        const { score, components, flags } = scoreMdsForClinician(m, clinShape);
+        const { score, components, flags } = scoreMdsForClinician(m, clinShape, region);
         ranked.push({
           mds_id: m.mds_id,
           mds_name: m.mds_name,
@@ -289,13 +342,15 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'rank_mds_candidates',
     {
-      description: 'Rank available BD MDS candidates for a Bangladesh clinician (NEMESIS scoring).',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX + 'Rank available MDS candidates for a clinician in the given region (NEMESIS scoring).',
+      inputSchema: toolInputSchema({
         clinician_id: z.string(),
         shift_date: z.string().describe('Target shift date yyyy-mm-dd (reserved for future constraints)'),
         top_n: z.number().int().min(1).max(50).optional().default(10),
         exclude_mds_ids: z.array(z.string()).optional().default([]),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runRankMdsCandidates(input)),
   );
@@ -310,22 +365,48 @@ export function registerNemesisTools(server: McpServer): void {
       rationale: string;
       confidence_score: number;
       flags_fired: string[];
+      region?: string;
     }) => {
-      void input.shift_date;
-      void input.rationale;
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
+      const { data: clinOk, error: cErr } = await db
+        .from('clinician_profile_info')
+        .select('clinician_id')
+        .eq('clinician_id', input.clinician_id)
+        .like('scribe_partner_site', clinicianPattern)
+        .maybeSingle();
+      throwIfError('propose_pairing.clinician', cErr);
+      if (!clinOk) throw new Error('clinician_not_in_region_scope');
+
+      const { data: mdsOk, error: mErr } = await db
+        .from('mds_profile_info')
+        .select('mds_id')
+        .eq('mds_id', input.mds_id)
+        .eq('service_provider', region)
+        .maybeSingle();
+      throwIfError('propose_pairing.mds', mErr);
+      if (!mdsOk) throw new Error('mds_not_in_region_scope');
+
       const id = randomUUID();
       const pairing_id = randomUUID();
+      const shiftDate = input.shift_date.slice(0, 10);
+      const tags = (input.flags_fired ?? []).filter(Boolean).join(',');
+      const rationaleSan = input.rationale.trim().replace(/\|/g, ' ');
+      const flagsFired =
+        rationaleSan.length > 0 ? (tags.length > 0 ? `${tags}|${rationaleSan}` : rationaleSan) : tags;
+
       const row = {
         id,
         clinician_id: input.clinician_id,
         recommended_mds_id: input.mds_id,
         nemesis_score: Math.round(input.confidence_score * 100),
-        flags_fired: (input.flags_fired ?? []).join(','),
+        flags_fired: flagsFired,
         feedback_rating: null as number | null,
         override_occurred: false,
         submitted_by: 'nemesis-mcp',
         created_at: new Date().toISOString(),
         pairing_id,
+        recommendation_date: shiftDate,
       };
       const { data, error } = await db.from('feedback_log').insert(row).select('id,pairing_id').limit(1);
       throwIfError('propose_pairing', error);
@@ -338,15 +419,18 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'propose_pairing',
     {
-      description: 'Record a NEMESIS pairing proposal in feedback_log.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Record a NEMESIS pairing proposal in feedback_log. shift_date is stored as recommendation_date. rationale is appended to flags_fired after a single | when both tags and rationale exist. Validates clinician + MDS are in the resolved region.',
+      inputSchema: toolInputSchema({
         clinician_id: z.string(),
         mds_id: z.string(),
         shift_date: z.string(),
         rationale: z.string(),
         confidence_score: z.number().min(0).max(1),
         flags_fired: z.array(z.string()).optional().default([]),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runProposePairing(input)),
   );
@@ -357,8 +441,10 @@ export function registerNemesisTools(server: McpServer): void {
     async (input: {
       pairing_id: string;
       feedback_rating: number;
+      region?: string;
       override_info?: { override_to_mds_id: string; override_reason: string };
     }) => {
+      resolveRegion(input.region);
       const patch: Record<string, unknown> = { feedback_rating: input.feedback_rating };
       if (input.override_info) {
         patch.override_occurred = true;
@@ -384,17 +470,20 @@ export function registerNemesisTools(server: McpServer): void {
   server.registerTool(
     'record_pairing_feedback',
     {
-      description: 'Update feedback_log by pairing_id and append an MCP audit row (no PII in audit payload).',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Update feedback_log by pairing_id and append an MCP audit row (no PII in audit payload). `region` is accepted for schema consistency only.',
+      inputSchema: toolInputSchema({
         pairing_id: z.string(),
         feedback_rating: z.number(),
+        region: toolRegionOptional,
         override_info: z
           .object({
             override_to_mds_id: z.string(),
             override_reason: z.string(),
           })
           .optional(),
-      },
+      }),
     },
     async (input) => asMcpTextContent(await runRecordPairingFeedback(input)),
   );

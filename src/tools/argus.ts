@@ -1,11 +1,21 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import { BD_CLINICIAN_SITE_PATTERN, BD_MDS_FILTER } from '../filters.js';
+import {
+  DEFAULT_REGION,
+  getClinicianSitePattern,
+  KNOWN_REGIONS,
+  resolveRegion,
+  toolInputSchema,
+  toolRegionOptional,
+  type Region,
+} from '../filters.js';
 import { computeLeaveProbability } from '../leaveHeuristics.js';
 import { asMcpTextContent, instrumented } from '../instrument.js';
 import { db } from '../supabase.js';
 import { mcpDb } from '../supabase.js';
+
+const REGION_DESC_PREFIX = 'Region-scoped. Defaults to AX-BD-Dhaka if region not passed. ';
 
 function throwIfError(context: string, error: { message: string } | null) {
   if (error) throw new Error(`${context}: ${error.message}`);
@@ -17,21 +27,34 @@ function predictedStatusFromProbability(p: number): string {
   return 'likely_in';
 }
 
+async function mdsServiceRegion(mdsId: string): Promise<Region> {
+  const { data, error } = await db
+    .from('mds_profile_info')
+    .select('service_provider')
+    .eq('mds_id', mdsId)
+    .maybeSingle();
+  throwIfError('mdsServiceRegion', error);
+  const sp = (data as { service_provider?: string } | null)?.service_provider;
+  if (sp && KNOWN_REGIONS.includes(sp as Region)) return sp as Region;
+  return DEFAULT_REGION;
+}
+
 export function registerArgusTools(server: McpServer): void {
   const runGetMdsAvailability = instrumented(
     'argus',
     'get_mds_availability',
-    async ({ mds_id, date }: { mds_id: string; date: string }) => {
+    async (input: { mds_id: string; date: string; region?: string }) => {
+      const region = resolveRegion(input.region);
       const { data: mds, error: mErr } = await db
         .from('mds_profile_info')
         .select('mds_id')
-        .eq('mds_id', mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('mds_id', input.mds_id)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('get_mds_availability.mds', mErr);
       if (!mds) return null;
 
-      const { data, error } = await db.from('mds_availability').select('*').eq('mds_id', mds_id).eq('date', date).maybeSingle();
+      const { data, error } = await db.from('mds_availability').select('*').eq('mds_id', input.mds_id).eq('date', input.date).maybeSingle();
       throwIfError('get_mds_availability', error);
       return data;
     },
@@ -41,8 +64,14 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'get_mds_availability',
     {
-      description: 'Fetch mds_availability for an MDS on a date, verifying BD scope on mds_profile_info.',
-      inputSchema: { mds_id: z.string(), date: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'Fetch mds_availability for an MDS on a date, verifying the MDS is in the given region.',
+      inputSchema: toolInputSchema({
+        mds_id: z.string(),
+        date: z.string(),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetMdsAvailability(input)),
   );
@@ -50,23 +79,24 @@ export function registerArgusTools(server: McpServer): void {
   const runGetMdsLeaveHistory = instrumented(
     'argus',
     'get_mds_leave_history',
-    async ({ mds_id, days_back }: { mds_id: string; days_back: number }) => {
+    async (input: { mds_id: string; days_back: number; region?: string }) => {
+      const region = resolveRegion(input.region);
       const { data: mds, error: mErr } = await db
         .from('mds_profile_info')
         .select('mds_id')
-        .eq('mds_id', mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('mds_id', input.mds_id)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('get_mds_leave_history.mds', mErr);
       if (!mds) return [];
 
       const since = new Date();
-      since.setUTCDate(since.getUTCDate() - days_back);
+      since.setUTCDate(since.getUTCDate() - input.days_back);
       const sinceStr = since.toISOString().slice(0, 10);
       const { data, error } = await db
         .from('argus_leave_entries')
         .select('*')
-        .eq('mds_id', mds_id)
+        .eq('mds_id', input.mds_id)
         .gte('leave_date', sinceStr);
       throwIfError('get_mds_leave_history', error);
       console.log('[argus.get_mds_leave_history] rowCount=%d', (data ?? []).length);
@@ -78,11 +108,13 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'get_mds_leave_history',
     {
-      description: 'Leave entries for a BD MDS over the last N days.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX + 'Leave entries for an MDS in the given region over the last N days.',
+      inputSchema: toolInputSchema({
         mds_id: z.string(),
         days_back: z.number().int().min(1).max(730).optional().default(180),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetMdsLeaveHistory(input)),
   );
@@ -90,9 +122,13 @@ export function registerArgusTools(server: McpServer): void {
   const runPredictLeaveProbability = instrumented(
     'argus',
     'predict_leave_probability',
-    async ({ mds_id, target_date }: { mds_id: string; target_date: string }) => {
-      const lp = await computeLeaveProbability(mds_id, target_date);
-      return { mds_id, target_date, leave_probability: lp.leave_probability, top_factors: lp.top_factors };
+    async (input: { mds_id: string; target_date: string; region?: string }) => {
+      const region =
+        input.region !== undefined && input.region !== ''
+          ? resolveRegion(input.region)
+          : await mdsServiceRegion(input.mds_id);
+      const lp = await computeLeaveProbability(input.mds_id, input.target_date, region);
+      return { mds_id: input.mds_id, target_date: input.target_date, leave_probability: lp.leave_probability, top_factors: lp.top_factors };
     },
     (out) => ({
       leave_probability: (out as { leave_probability: number }).leave_probability,
@@ -103,8 +139,14 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'predict_leave_probability',
     {
-      description: 'Heuristic leave probability for an MDS on a target date.',
-      inputSchema: { mds_id: z.string(), target_date: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'Heuristic leave probability for an MDS on a target date using that MDS region holiday calendar. When `region` is omitted, uses service_provider from mds_profile_info when known, else MCP_DEFAULT_REGION.',
+      inputSchema: toolInputSchema({
+        mds_id: z.string(),
+        target_date: z.string(),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runPredictLeaveProbability(input)),
   );
@@ -118,7 +160,21 @@ export function registerArgusTools(server: McpServer): void {
       probability: number;
       top_factors: { factor: string; contribution: number }[];
       confidence: string;
+      region?: string;
     }) => {
+      const region =
+        input.region !== undefined && input.region !== ''
+          ? resolveRegion(input.region)
+          : await mdsServiceRegion(input.mds_id);
+      const { data: mdsOk, error: mErr } = await db
+        .from('mds_profile_info')
+        .select('mds_id')
+        .eq('mds_id', input.mds_id)
+        .eq('service_provider', region)
+        .maybeSingle();
+      throwIfError('record_leave_prediction.mds', mErr);
+      if (!mdsOk) throw new Error('mds_not_in_region_scope');
+
       const notes = JSON.stringify(input.top_factors).slice(0, 500);
       const row = {
         mds_id: input.mds_id,
@@ -138,14 +194,17 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'record_leave_prediction',
     {
-      description: 'Persist a daily coverage forecast row for an MDS.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX +
+        'Persist a daily coverage forecast row for an MDS in the given region. When `region` is omitted, uses service_provider from mds_profile_info when known, else MCP_DEFAULT_REGION.',
+      inputSchema: toolInputSchema({
         mds_id: z.string(),
         target_date: z.string(),
         probability: z.number(),
         top_factors: z.array(z.object({ factor: z.string(), contribution: z.number() })),
         confidence: z.string().optional().default('medium'),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runRecordLeavePrediction(input)),
   );
@@ -153,13 +212,20 @@ export function registerArgusTools(server: McpServer): void {
   const runGetCoverageGaps = instrumented(
     'argus',
     'get_coverage_gaps',
-    async (filters: { start_date: string; end_date: string; resolved?: boolean; min_confidence?: string }) => {
-      const { data: bdMds, error: bErr } = await db
+    async (filters: {
+      start_date: string;
+      end_date: string;
+      resolved?: boolean;
+      min_confidence?: string;
+      region?: string;
+    }) => {
+      const region = resolveRegion(filters.region);
+      const { data: scopedMds, error: bErr } = await db
         .from('mds_profile_info')
         .select('mds_id')
-        .eq('service_provider', BD_MDS_FILTER.service_provider);
-      throwIfError('get_coverage_gaps.bd_mds', bErr);
-      const allowed = new Set((bdMds ?? []).map((r) => String((r as { mds_id: string }).mds_id)));
+        .eq('service_provider', region);
+      throwIfError('get_coverage_gaps.scoped_mds', bErr);
+      const allowed = new Set((scopedMds ?? []).map((r) => String((r as { mds_id: string }).mds_id)));
 
       let q = db.from('argus_coverage_gaps').select('*').gte('date', filters.start_date).lte('date', filters.end_date);
       if (filters.resolved === false) q = q.is('resolved_at', null);
@@ -177,13 +243,15 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'get_coverage_gaps',
     {
-      description: 'Coverage gaps in a date range, BD MDS scope via mds_profile_info membership.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX + 'Coverage gaps in a date range, scoped to MDS rows in the given region.',
+      inputSchema: toolInputSchema({
         start_date: z.string(),
         end_date: z.string(),
         resolved: z.boolean().optional(),
         min_confidence: z.string().optional(),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetCoverageGaps(input)),
   );
@@ -198,15 +266,17 @@ export function registerArgusTools(server: McpServer): void {
       affected_clinician_id?: string;
       confidence: string;
       specialty?: string;
+      region?: string;
     }) => {
+      const region = resolveRegion(input.region);
       const { data: mds, error: mErr } = await db
         .from('mds_profile_info')
         .select('mds_id,mds_name')
         .eq('mds_id', input.mds_id)
-        .eq('service_provider', BD_MDS_FILTER.service_provider)
+        .eq('service_provider', region)
         .maybeSingle();
       throwIfError('record_coverage_gap.mds', mErr);
-      if (!mds) throw new Error('mds_not_bd_scope');
+      if (!mds) throw new Error('mds_not_in_region_scope');
 
       const row = {
         mds_id: input.mds_id,
@@ -231,15 +301,17 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'record_coverage_gap',
     {
-      description: 'Insert a coverage gap for a BD-verified MDS.',
-      inputSchema: {
+      description:
+        REGION_DESC_PREFIX + 'Insert a coverage gap for an MDS verified in the given region.',
+      inputSchema: toolInputSchema({
         mds_id: z.string(),
         date: z.string(),
         gap_type: z.string(),
         affected_clinician_id: z.string().optional(),
         confidence: z.string().optional().default('medium'),
         specialty: z.string().optional(),
-      },
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runRecordCoverageGap(input)),
   );
@@ -247,7 +319,8 @@ export function registerArgusTools(server: McpServer): void {
   const runResolveCoverageGap = instrumented(
     'argus',
     'resolve_coverage_gap',
-    async ({ gap_id, resolution }: { gap_id: string; resolution: string }) => {
+    async ({ gap_id, resolution, region }: { gap_id: string; resolution: string; region?: string }) => {
+      resolveRegion(region);
       const { data, error } = await db
         .from('argus_coverage_gaps')
         .update({ resolution, resolved_at: new Date().toISOString() })
@@ -268,8 +341,14 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'resolve_coverage_gap',
     {
-      description: 'Mark a coverage gap resolved and append an audit row (resolution text not duplicated in logs).',
-      inputSchema: { gap_id: z.string(), resolution: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'Mark a coverage gap resolved and append an audit row (resolution text not duplicated in logs). `region` is accepted for schema consistency only.',
+      inputSchema: toolInputSchema({
+        gap_id: z.string(),
+        resolution: z.string(),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runResolveCoverageGap(input)),
   );
@@ -277,8 +356,10 @@ export function registerArgusTools(server: McpServer): void {
   const runGetDailyCoveragePlan = instrumented(
     'argus',
     'get_daily_coverage_plan',
-    async ({ date }: { date: string }) => {
-      const { data: plans, error: pErr } = await db.from('daily_coverage_plan').select('*').eq('date', date);
+    async (input: { date: string; region?: string }) => {
+      const region = resolveRegion(input.region);
+      const clinicianPattern = getClinicianSitePattern(region);
+      const { data: plans, error: pErr } = await db.from('daily_coverage_plan').select('*').eq('date', input.date);
       throwIfError('get_daily_coverage_plan.plans', pErr);
       const ids = [...new Set((plans ?? []).map((r) => String((r as { clinician_id: string }).clinician_id)))];
       if (ids.length === 0) {
@@ -289,7 +370,7 @@ export function registerArgusTools(server: McpServer): void {
         .from('clinician_profile_info')
         .select('clinician_id,scribe_partner_site')
         .in('clinician_id', ids)
-        .like('scribe_partner_site', BD_CLINICIAN_SITE_PATTERN);
+        .like('scribe_partner_site', clinicianPattern);
       throwIfError('get_daily_coverage_plan.clinicians', cErr);
       const allowed = new Set((clinicians ?? []).map((c) => String((c as { clinician_id: string }).clinician_id)));
       const rows = (plans ?? []).filter((p) => allowed.has(String((p as { clinician_id: string }).clinician_id)));
@@ -302,8 +383,13 @@ export function registerArgusTools(server: McpServer): void {
   server.registerTool(
     'get_daily_coverage_plan',
     {
-      description: 'Daily coverage plan rows for a date, restricted to Bangladesh-site clinicians.',
-      inputSchema: { date: z.string() },
+      description:
+        REGION_DESC_PREFIX +
+        'Daily coverage plan rows for a date, restricted to clinicians matching the region site pattern.',
+      inputSchema: toolInputSchema({
+        date: z.string(),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetDailyCoveragePlan(input)),
   );

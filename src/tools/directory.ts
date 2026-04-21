@@ -1,7 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import { getClinicianSitePattern, resolveRegion, toolRegionOptional, type Region } from '../filters.js';
+import {
+  getClinicianSitePattern,
+  resolveRegion,
+  toolInputSchema,
+  toolRegionOptional,
+  type Region,
+} from '../filters.js';
 import { getHolidayTable } from '../holidays.js';
 import { asMcpTextContent, instrumented } from '../instrument.js';
 import { db } from '../supabase.js';
@@ -28,8 +34,7 @@ async function queryHolidaysForRegion(start_date: string, end_date: string, regi
   return data ?? [];
 }
 
-/** Explicit Zod object so MCP JSON Schema and parsing include `region` (raw `{ mds_id, region }` shapes are normalized by the SDK). */
-const getMdsProfileInputSchema = z.object({
+const getMdsProfileInputSchema = toolInputSchema({
   mds_id: z.string().describe('The MDS ID'),
   region: toolRegionOptional,
 });
@@ -39,7 +44,6 @@ export function registerDirectoryTools(server: McpServer): void {
     'integrity',
     'get_mds_profile',
     async (input: { mds_id: string; region?: string }) => {
-      console.log('[get_mds_profile] raw input:', JSON.stringify(input));
       const region = resolveRegion(input.region);
       const { data, error } = await db
         .from('mds_profile_info')
@@ -97,7 +101,7 @@ export function registerDirectoryTools(server: McpServer): void {
     {
       description:
         REGION_DESC_PREFIX + 'Search MDS directory with optional filters, scoped to the given region service_provider.',
-      inputSchema: {
+      inputSchema: toolInputSchema({
         specialty: z.string().optional(),
         is_available: z.boolean().optional(),
         hot_list: z.boolean().optional(),
@@ -105,7 +109,7 @@ export function registerDirectoryTools(server: McpServer): void {
         employment_status: z.string().optional(),
         limit: z.number().int().min(1).max(200).optional().default(50),
         region: toolRegionOptional,
-      },
+      }),
     },
     async (input) => asMcpTextContent(await runSearchMds(input)),
   );
@@ -134,7 +138,10 @@ export function registerDirectoryTools(server: McpServer): void {
       description:
         REGION_DESC_PREFIX +
         'Get full clinician profile for a clinician whose site pattern matches the given MDS region.',
-      inputSchema: { clinician_id: z.string().describe('Clinician ID'), region: toolRegionOptional },
+      inputSchema: toolInputSchema({
+        clinician_id: z.string().describe('Clinician ID'),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetClinicianProfile(input)),
   );
@@ -171,14 +178,14 @@ export function registerDirectoryTools(server: McpServer): void {
       description:
         REGION_DESC_PREFIX +
         'Search clinicians whose scribe_partner_site matches the given MDS region pattern.',
-      inputSchema: {
+      inputSchema: toolInputSchema({
         specialty: z.string().optional(),
         product_line: z.string().optional(),
         ehr_system: z.string().optional(),
         is_ramp_up: z.boolean().optional(),
         limit: z.number().int().min(1).max(200).optional().default(50),
         region: toolRegionOptional,
-      },
+      }),
     },
     async (input) => asMcpTextContent(await runSearchClinicians(input)),
   );
@@ -199,11 +206,11 @@ export function registerDirectoryTools(server: McpServer): void {
       description:
         REGION_DESC_PREFIX +
         'List holidays for an MCP region in a date range (bd_holidays vs in_holidays). When MCP_HOLIDAYS_HAVE_REGION=true, filters by holidays.region. Returns [] when the region has no holiday table.',
-      inputSchema: {
+      inputSchema: toolInputSchema({
         start_date: z.string(),
         end_date: z.string(),
         region: toolRegionOptional,
-      },
+      }),
     },
     async (input) => asMcpTextContent(await runGetRegionalHolidays(input)),
   );
@@ -224,11 +231,11 @@ export function registerDirectoryTools(server: McpServer): void {
       description:
         REGION_DESC_PREFIX +
         'Same behavior as get_regional_holidays. Prefer get_regional_holidays for new integrations.',
-      inputSchema: {
+      inputSchema: toolInputSchema({
         start_date: z.string(),
         end_date: z.string(),
         region: toolRegionOptional,
-      },
+      }),
     },
     async (input) => asMcpTextContent(await runGetHolidays(input)),
   );
@@ -246,10 +253,10 @@ export function registerDirectoryTools(server: McpServer): void {
     {
       description:
         '[DEPRECATED] Alias for get_regional_holidays with region locked to AX-BD-Dhaka. Prefer get_regional_holidays.',
-      inputSchema: {
+      inputSchema: toolInputSchema({
         start_date: z.string().describe('Range start yyyy-mm-dd'),
         end_date: z.string().describe('Range end yyyy-mm-dd'),
-      },
+      }),
     },
     async (input) => asMcpTextContent(await runGetBdHolidays(input)),
   );
@@ -275,7 +282,10 @@ export function registerDirectoryTools(server: McpServer): void {
       description:
         REGION_DESC_PREFIX +
         'List leave entitlement rows, optionally filtered by leave type. `region` is accepted for schema consistency only.',
-      inputSchema: { leave_type: z.string().optional(), region: toolRegionOptional },
+      inputSchema: toolInputSchema({
+        leave_type: z.string().optional(),
+        region: toolRegionOptional,
+      }),
     },
     async (input) => asMcpTextContent(await runGetLeaveEntitlements(input)),
   );
