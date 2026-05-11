@@ -329,7 +329,11 @@ export function registerArgusTools(server: McpServer): void {
       throwIfError('resolve_coverage_gap', error);
       const { error: audErr } = await mcpDb.from('audit_log').insert({
         action: 'resolve_coverage_gap',
-        details: { gap_id, resolution_len: resolution.length },
+        target_table: 'argus_coverage_gaps',
+        target_id: gap_id,
+        actor: 'argus-mcp',
+        actor_type: 'system',
+        diff: { resolution_len: resolution.length },
       });
       if (audErr) console.error('[argus.resolve_coverage_gap] audit_insert_failed code=%s', audErr.code ?? 'n/a');
       console.log('[argus.resolve_coverage_gap] updated_rows=%d', (data ?? []).length);

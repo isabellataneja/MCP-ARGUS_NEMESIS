@@ -467,10 +467,11 @@ export function registerNemesisTools(server: McpServer): void {
       throwIfError('record_pairing_feedback', error);
       const { error: audErr } = await mcpDb.from('audit_log').insert({
         action: 'record_pairing_feedback',
-        details: {
-          pairing_id: input.pairing_id,
-          has_override: Boolean(input.override_info),
-        },
+        target_table: 'feedback_log',
+        target_id: input.pairing_id,
+        actor: 'nemesis-mcp',
+        actor_type: 'system',
+        diff: { has_override: Boolean(input.override_info) },
       });
       if (audErr) console.error('[nemesis.record_pairing_feedback] audit_insert_failed code=%s', audErr.code ?? 'n/a');
       console.log('[nemesis.record_pairing_feedback] updated_rows=%d', (data ?? []).length);
