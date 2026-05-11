@@ -10,6 +10,7 @@ import {
   toolRegionOptional,
   type Region,
 } from '../filters.js';
+import { buildFeedbackModifier } from '../feedback/modifier.js';
 import { asMcpTextContent, instrumented } from '../instrument.js';
 import { mcpDb } from '../supabase.js';
 import { db } from '../supabase.js';
@@ -296,14 +297,17 @@ export function registerNemesisTools(server: McpServer): void {
       throwIfError('rank_mds_candidates.clinician', cErr);
       if (!clinician) throw new Error('clinician_not_found_or_not_region_scope');
 
-      const { data: candidates, error: mErr } = await db
-        .from('mds_profile_info')
-        .select(
-          'mds_id,mds_name,specialty_experience,active_ehrs,sla_met_pct,ai_mds_retention_pct,avg_overall_review,hot_list,open_escalations,open_remediation_p1_p2,active_p3_remediation,employment_status,is_available',
-        )
-        .eq('service_provider', region)
-        .eq('is_available', true)
-        .limit(800);
+      const [{ data: candidates, error: mErr }, modifier] = await Promise.all([
+        db
+          .from('mds_profile_info')
+          .select(
+            'mds_id,mds_name,specialty_experience,active_ehrs,sla_met_pct,ai_mds_retention_pct,avg_overall_review,hot_list,open_escalations,open_remediation_p1_p2,active_p3_remediation,employment_status,is_available',
+          )
+          .eq('service_provider', region)
+          .eq('is_available', true)
+          .limit(800),
+        buildFeedbackModifier(clinician_id),
+      ]);
       throwIfError('rank_mds_candidates.mds', mErr);
 
       const exclude = new Set(exclude_mds_ids ?? []);
@@ -317,22 +321,30 @@ export function registerNemesisTools(server: McpServer): void {
         const m = raw as MdsCandidateShape & { employment_status?: string | null };
         if (exclude.has(m.mds_id)) continue;
         if (!isActiveEmployment(m.employment_status ?? null)) continue;
-        const { score, components, flags } = scoreMdsForClinician(m, clinShape, region);
+        const { score, components, flags, capped, cap_reason } = scoreMdsForClinician(
+          m,
+          clinShape,
+          region,
+          modifier,
+        );
         ranked.push({
           mds_id: m.mds_id,
           mds_name: m.mds_name,
           score,
           components,
           flags,
+          capped,
+          cap_reason,
         });
       }
       ranked.sort((a, b) => b.score - a.score);
       const top = ranked.slice(0, top_n);
       console.log(
-        '[nemesis.rank_mds_candidates] shift_date=%s top_n=%d resultCount=%d',
+        '[nemesis.rank_mds_candidates] shift_date=%s top_n=%d resultCount=%d feedback_count=%d',
         shift_date,
         top_n,
         top.length,
+        modifier.feedback_count,
       );
       return top;
     },

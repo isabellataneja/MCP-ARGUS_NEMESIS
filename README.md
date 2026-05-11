@@ -1,6 +1,8 @@
 # MCP ARGUS / NEMESIS bridge
 
-Remote [Model Context Protocol](https://modelcontextprotocol.io) server on **Node 20+** and **TypeScript** (ES modules). It exposes HTTP Streamable MCP at `POST /mcp` for agents hosted on Vercel, with tools that read/write **Supabase** using the **service role** key on the server only. **Bangladesh (`country_code = BD`)** is enforced on every MDS-related select via the query layer.
+Remote [Model Context Protocol](https://modelcontextprotocol.io) server on **Node 20+** and **TypeScript** (ES modules). It exposes HTTP Streamable MCP at `POST /mcp` for agents hosted on Vercel, with tools that read/write **Supabase** using the **service role** key on the server only.
+
+**Region scoping** — Every NEMESIS / ARGUS tool accepts an optional `region` argument and resolves it via `src/filters.ts`. Default is `AX-BD-Dhaka` (override with `MCP_DEFAULT_REGION`). Allowed regions: `AX-BD-Dhaka`, `AX-IN-Bangalore`, `IN-IDS-Mohali`, `IN-IDS-Noida`, `SL-Medsource-Colombo`, `AX-US-San Francisco`. Filtering uses region-prefix matching on `clinician_profile_info.scribe_partner_site` (e.g. `AX-BD-%`) and exact match on `mds_profile_info.service_provider`.
 
 ## Environment variables
 
@@ -47,18 +49,19 @@ npm start
 
 Railway runs `npm install` and `npm run build` via Nixpacks; the `build` script must succeed (TypeScript → `dist/`).
 
-## Supabase schema (stubs)
+## Supabase schema
 
-Tools target placeholder tables; create them (or change the table names in `src/tools/nemesis.ts` and `src/tools/argus.ts`) to match your schema. Every **read** that goes through `scopeBangladesh()` must include a `country_code` column compatible with value `BD`.
+Tools target tables in the shared `public` schema:
 
-| Tool | Stub table |
-|------|------------|
-| `get_available_mds` | `nemesis_mds_availability` |
-| `get_clinician_preferences` | `nemesis_clinician_preferences` |
-| `propose_pairing` | `nemesis_pairing_proposals` |
-| `get_leave_probability` | `argus_mds_leave_forecasts` |
-| `get_historical_leave_patterns` | `argus_mds_leave_history` |
-| `flag_high_risk_absences` | `argus_mds_absence_risk` |
+| Domain | Tables read | Tables written |
+|---|---|---|
+| Directory (`src/tools/directory.ts`) | `mds_profile_info`, `clinician_profile_info`, regional holiday tables | — |
+| NEMESIS pairing (`src/tools/nemesis.ts`) | `mds_profile_info`, `clinician_profile_info`, `clinician_mds_pairings`, `pairing_history`, `nemesis_note_log` | `feedback_log` (proposals + ratings) |
+| NEMESIS feedback (`src/tools/feedback.ts`) | `feedback_log`, `pairing_history` | — |
+| ARGUS leave/coverage (`src/tools/argus.ts`) | `mds_availability`, `argus_leave_entries`, `argus_coverage_gaps`, `daily_coverage_plan` | `argus_daily_coverage_forecast`, `argus_coverage_gaps` |
+| Observability (`src/instrument.ts`) | — | `mcp.agent_runs`, `mcp.audit_log` |
+
+`feedback_log` and `pairing_history` need `override_reason_category` (migration 009+) for category-aware learning; the categorizer falls back to free-text parsing on rows without it.
 
 ## Vercel / agent client configuration
 
