@@ -1,12 +1,14 @@
 import 'dotenv/config';
 
 import express from 'express';
+import cron from 'node-cron';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 import { requireBearer } from './auth.js';
 import { requestAgentStore } from './context.js';
 import { registerAllTools } from './register.js';
+import { syncQualityVariance } from '../services/quality-variance-sync/index.js';
 
 function requireEnv(name: string): string {
   const v = process.env[name]?.trim();
@@ -87,7 +89,39 @@ function main() {
 
   app.listen(config.port, '0.0.0.0', () => {
     console.log('[server] listening host=0.0.0.0 port=%d', config.port);
+    registerQualityVarianceCron();
   });
+}
+
+function registerQualityVarianceCron(): void {
+  if (process.env.QUALITY_VARIANCE_CRON_ENABLED !== 'true') {
+    console.log('[cron] quality-variance-sync skipped (QUALITY_VARIANCE_CRON_ENABLED!=true)');
+    return;
+  }
+  cron.schedule(
+    '0 4 * * *',
+    () => {
+      console.log('[cron] quality-variance-sync starting');
+      syncQualityVariance()
+        .then((result) => {
+          console.log(
+            '[cron] quality-variance-sync ok window=%s rows_computed=%d rows_upserted=%d',
+            result.window_end_date,
+            result.rows_computed,
+            result.rows_upserted,
+          );
+        })
+        .catch((err) => {
+          console.error(
+            '[cron] quality-variance-sync failed type=%s message=%s',
+            err instanceof Error ? err.name : typeof err,
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+    },
+    { timezone: 'UTC' },
+  );
+  console.log('[cron] quality-variance-sync registered (0 4 * * * UTC)');
 }
 
 main();

@@ -17,8 +17,9 @@ scoring can factor objective quality metrics into pairing decisions.
 |---|---|---|
 | 1 | Audit + hosting decision | ✅ Done — hosting locked to this MCP service (extend, not split) |
 | 1.5 | Scaffolding (this directory) + cron-options doc | ✅ Done — see below |
+| 1.6 | Cron decision lock-in + dormant wire-up | ✅ Done 2026-05-12 — option (a) `node-cron`, gated on `QUALITY_VARIANCE_CRON_ENABLED=false` |
 | 2 | Schema migration + variance compute (+ unit tests against Retool parity) | ⏸ Blocked on creds |
-| 3 | Sync job wiring + reconciliation report | ⏸ Blocked on creds + cron decision |
+| 3 | Sync job wiring + reconciliation report | ⏸ Blocked on creds |
 | 4 | NEMESIS scoring integration (penalty / bonus / flag) | ⏸ Depends on Phase 3 |
 | 5 | Outcome review removal + cron writer | ⏸ Depends on Phase 4 |
 
@@ -60,15 +61,30 @@ All values live in Railway env vars on the `nemesis-argus-mcp` service.
 | `SUPABASE_SERVICE_ROLE_KEY` | Service-role client for the above |
 | `MCP_DEFAULT_REGION` | Default `AX-BD-Dhaka` — used if a windowed pull needs to scope by region |
 
-## Cron — three options, decision deferred to Phase 2
+## Cron — decision: option (a) `node-cron` (locked 2026-05-12)
 
-**Probe finding (2026-05-11):** the MCP service has no cron infrastructure
-today. No `node-cron`, no Railway cron config in `railway.json`, no
-`setInterval`-based scheduler. Per Phase 1 audit instruction "do not invent a
-cron registry" — this scaffold registers nothing. The Phase 2 implementer
-picks one of these and wires it then.
+**Decision:** option (a) below. `node-cron` registered inside `src/index.ts`
+after `app.listen()`, gated on `QUALITY_VARIANCE_CRON_ENABLED`. The flag
+defaults `false`, so the cron is *dormant* until Phase 2 ships the real
+sync impl. Options (b) and (c) kept below as historical context.
 
-### (a) `node-cron` inside `src/index.ts` (recommended)
+**Phase 1.5 probe finding (2026-05-11):** the MCP service had no cron
+infrastructure — no `node-cron`, no Railway cron config in `railway.json`,
+no `setInterval`-based scheduler. Phase 1.6 introduces `node-cron`.
+
+**What Phase 1.6 wired (today):**
+
+- Added `node-cron` to `package.json` deps + `@types/node-cron` to devDeps.
+- Brought `services/**/*.ts` into `tsconfig.json` include (was previously
+  out of scope so the stub couldn't be statically imported).
+- Imported `syncQualityVariance` in `src/index.ts` and registered the
+  schedule when `QUALITY_VARIANCE_CRON_ENABLED === 'true'`.
+- Default = `false`. With the flag off, the server logs `[cron] … skipped`
+  and never imports or invokes the stub. With the flag on (before Phase 2),
+  the stub throws `Not implemented` on the first fire and the error is
+  logged — *not* swallowed silently — and the server keeps running.
+
+### (a) `node-cron` inside `src/index.ts` — IMPLEMENTED
 
 ```ts
 // in src/index.ts main(), AFTER app.listen():
@@ -101,7 +117,7 @@ Stand up a second Railway service of type "Cron job", scheduled `0 4 * * *`, who
 
 Defeats the point of hosting the sync on Railway, adds a third secret-rotation path. Listed only so it's explicitly ruled out.
 
-**Recommendation when Phase 2 starts: (a).**
+**Decision: (a). Locked 2026-05-12, wired dormant per the "What Phase 1.6 wired" notes above.**
 
 ## Files in this directory
 
