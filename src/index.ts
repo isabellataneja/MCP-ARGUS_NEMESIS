@@ -5,7 +5,7 @@ import cron from 'node-cron';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
-import { requireBearer } from './auth.js';
+import { requireBearer, requireReportBearer } from './auth.js';
 import { reportHandler } from './report.js';
 import { requestAgentStore } from './context.js';
 import { registerAllTools } from './register.js';
@@ -51,8 +51,9 @@ function main() {
     res.json({ ok: true });
   });
 
-  // Fleet run-report ingest for non-native agents (bearer-authed, PII-free).
-  app.post('/report', requireBearer, reportHandler);
+  // Fleet run-report ingest for non-native agents. Uses the least-privilege
+  // report token (or the full bearer) — never grants /mcp tool access.
+  app.post('/report', requireReportBearer, reportHandler);
 
   // TODO: enable rate limiting for /mcp once limits are tuned for Vercel agent traffic
   // import rateLimit from 'express-rate-limit';

@@ -1,6 +1,20 @@
 import type { RequestHandler } from 'express';
+import { timingSafeEqual } from 'crypto';
 
 const BEARER_PREFIX = 'Bearer ';
+
+function presentedToken(header: unknown): string | null {
+  if (typeof header !== 'string' || !header.startsWith(BEARER_PREFIX)) return null;
+  const t = header.slice(BEARER_PREFIX.length);
+  return t.length > 0 ? t : null;
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
 
 /**
  * Validates `Authorization: Bearer <token>` against MCP_BEARER_TOKEN.
@@ -21,6 +35,38 @@ export const requireBearer: RequestHandler = (req, res, next) => {
 
   const token = header.slice(BEARER_PREFIX.length);
   if (token.length === 0 || token !== expected) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+
+  next();
+};
+
+/**
+ * Auth for POST /report only. Accepts a dedicated least-privilege
+ * MCP_REPORT_TOKEN (what the fleet agents hold) OR the full MCP_BEARER_TOKEN
+ * (admin). This lets cronus / ehr-inbox / hephaestus write telemetry WITHOUT a
+ * token that can also invoke the NEMESIS/ARGUS tools on /mcp — smaller blast
+ * radius if any agent's env leaks. Constant-time comparison; fail-closed.
+ */
+export const requireReportBearer: RequestHandler = (req, res, next) => {
+  const reportToken = process.env.MCP_REPORT_TOKEN;
+  const fullToken = process.env.MCP_BEARER_TOKEN;
+  if (!reportToken && !fullToken) {
+    res.status(500).json({ error: 'server_misconfigured' });
+    return;
+  }
+
+  const token = presentedToken(req.headers.authorization);
+  if (!token) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+
+  const ok =
+    (!!reportToken && constantTimeEquals(token, reportToken)) ||
+    (!!fullToken && constantTimeEquals(token, fullToken));
+  if (!ok) {
     res.status(401).json({ error: 'unauthorized' });
     return;
   }
