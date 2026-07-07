@@ -6,6 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 import { requireBearer } from './auth.js';
+import { reportHandler } from './report.js';
 import { requestAgentStore } from './context.js';
 import { registerAllTools } from './register.js';
 import { syncQualityVariance } from '../services/quality-variance-sync/index.js';
@@ -49,6 +50,9 @@ function main() {
   app.get('/health', (_req, res) => {
     res.json({ ok: true });
   });
+
+  // Fleet run-report ingest for non-native agents (bearer-authed, PII-free).
+  app.post('/report', requireBearer, reportHandler);
 
   // TODO: enable rate limiting for /mcp once limits are tuned for Vercel agent traffic
   // import rateLimit from 'express-rate-limit';

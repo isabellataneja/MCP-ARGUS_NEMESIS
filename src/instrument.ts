@@ -60,6 +60,8 @@ export function instrumented<TIn, TOut>(
       const caller = getRequestAgent()?.agentName ?? null;
       const row = {
         agent,
+        agent_slug: agent,
+        source_project: 'MCP-ARGUS_NEMESIS',
         tool_name: toolName,
         input_shape: describeShape(input),
         output_summary: success && output ? summarize(output) : {},
