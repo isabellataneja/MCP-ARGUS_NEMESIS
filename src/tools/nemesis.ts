@@ -500,4 +500,71 @@ export function registerNemesisTools(server: McpServer): void {
     },
     async (input) => asMcpTextContent(await runRecordPairingFeedback(input)),
   );
+  /**
+   * Reverse Quality Check — thin proxy to the NEMESIS app's batch endpoint
+   * (POST /api/reverse-quality/run), which reuses the app's real decision-tree
+   * + scoring pipeline over the currently-active roster and writes
+   * mcp.reverse_quality_flags. The heavy lifting (and its own agent_runs row,
+   * tool_name='reverse_quality_check') happens app-side; this tool logs the
+   * trigger under tool_name='trigger_reverse_quality_check'.
+   * Env: NEMESIS_APP_URL + NEMESIS_SYNC_SECRET (the app's INTERNAL_SYNC_SECRET).
+   */
+  const runReverseQualityCheck = instrumented(
+    'nemesis',
+    'trigger_reverse_quality_check',
+    async (input: { shift_date?: string; clinician_id?: string; dry_run?: boolean }) => {
+      const base = process.env.NEMESIS_APP_URL?.trim();
+      const secret = process.env.NEMESIS_SYNC_SECRET?.trim();
+      if (!base || !secret) {
+        throw new Error('NEMESIS_APP_URL / NEMESIS_SYNC_SECRET not configured on this deployment.');
+      }
+      const res = await fetch(`${base.replace(/\/$/, '')}/api/reverse-quality/run`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${secret}`,
+          'x-caller': 'mcp:nemesis',
+        },
+        body: JSON.stringify({
+          shift_date: input.shift_date,
+          clinician_id: input.clinician_id,
+          dry_run: input.dry_run === true,
+        }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        run_id?: string;
+        summary?: Record<string, unknown>;
+        writes?: Record<string, unknown> | null;
+        error?: string;
+      };
+      if (!res.ok || body.ok !== true) {
+        throw new Error(`reverse quality run failed (HTTP ${res.status}): ${body.error ?? 'unknown error'}`);
+      }
+      return { run_id: body.run_id, summary: body.summary, writes: body.writes ?? null };
+    },
+    (out) => ({
+      run_id: (out as { run_id?: string }).run_id ?? null,
+      summary: (out as { summary?: Record<string, unknown> }).summary ?? {},
+    }),
+  );
+
+  server.registerTool(
+    'reverse_quality_check',
+    {
+      description:
+        'Run the NEMESIS Reverse Quality Check: re-score every currently-active clinician<->MDS pairing with the ' +
+        'real NEMESIS decision tree and flag pairings NEMESIS would NOT recommend into mcp.reverse_quality_flags ' +
+        '(surfaced in OLYMPUS). dry_run=true reports counts without writing flags.',
+      inputSchema: toolInputSchema({
+        shift_date: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .optional(),
+        clinician_id: z.string().optional(),
+        dry_run: z.boolean().optional(),
+      }),
+    },
+    async (input) => asMcpTextContent(await runReverseQualityCheck(input)),
+  );
 }
