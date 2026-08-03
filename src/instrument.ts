@@ -1,7 +1,7 @@
 import { getRequestAgent } from './context.js';
 import { mcpDb } from './supabase.js';
 
-export type AgentKind = 'nemesis' | 'argus' | 'forecaster' | 'integrity';
+export type AgentKind = 'nemesis' | 'argus' | 'forecaster' | 'integrity' | 'cronus';
 
 /**
  * Per-field value kinds for `agent_runs.input_shape`. No key whitelist.

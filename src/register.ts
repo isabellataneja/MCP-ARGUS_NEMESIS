@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { registerArgusTools } from './tools/argus.js';
 import { registerContextTools } from './tools/context.js';
+import { registerCronusTools } from './tools/cronus.js';
 import { registerDirectoryTools } from './tools/directory.js';
 import { registerFeedbackTools } from './tools/feedback.js';
 import { registerNemesisTools } from './tools/nemesis.js';
@@ -14,4 +15,5 @@ export function registerAllTools(server: McpServer): void {
   registerContextTools(server);
   registerArgusTools(server);
   registerOrchestrationTools(server);
+  registerCronusTools(server);
 }

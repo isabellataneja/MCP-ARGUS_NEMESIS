@@ -7,6 +7,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 import { requireBearer, requireReportBearer } from './auth.js';
 import { reportHandler } from './report.js';
+import { toolsCallHandler } from './toolsCall.js';
 import { requestAgentStore } from './context.js';
 import { registerAllTools } from './register.js';
 import { syncQualityVariance } from '../services/quality-variance-sync/index.js';
@@ -54,6 +55,10 @@ function main() {
   // Fleet run-report ingest for non-native agents. Uses the least-privilege
   // report token (or the full bearer) — never grants /mcp tool access.
   app.post('/report', requireReportBearer, reportHandler);
+
+  // REST tool endpoint for the CRONUS app + note-cache sync (envelope shape
+  // from MCP_TOOLS_TO_ADD.md). Same bearer as /mcp; see src/toolsCall.ts.
+  app.post('/tools/call', requireBearer, toolsCallHandler);
 
   // TODO: enable rate limiting for /mcp once limits are tuned for Vercel agent traffic
   // import rateLimit from 'express-rate-limit';
