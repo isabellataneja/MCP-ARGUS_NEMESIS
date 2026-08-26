@@ -43,6 +43,46 @@ export const requireBearer: RequestHandler = (req, res, next) => {
 };
 
 /**
+ * Scope granted to the presented /mcp bearer. `full` (MCP_BEARER_TOKEN) sees
+ * every tool; `argus_eval` (ARGUS_EVAL_TOKEN, held by NEMESIS adhoc) sees only
+ * `argus_evaluate_leave` — same least-privilege idea as MCP_REPORT_TOKEN.
+ */
+export type McpScope = 'full' | 'argus_eval';
+
+/**
+ * Auth for POST /mcp. Accepts MCP_BEARER_TOKEN (full toolset) or
+ * ARGUS_EVAL_TOKEN (argus_evaluate_leave only); sets res.locals.mcpScope so
+ * the handler can register the matching toolset. Constant-time; fail-closed.
+ */
+export const requireMcpBearer: RequestHandler = (req, res, next) => {
+  const fullToken = process.env.MCP_BEARER_TOKEN;
+  const evalToken = process.env.ARGUS_EVAL_TOKEN;
+  if (!fullToken) {
+    res.status(500).json({ error: 'server_misconfigured' });
+    return;
+  }
+
+  const token = presentedToken(req.headers.authorization);
+  if (!token) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+
+  if (constantTimeEquals(token, fullToken)) {
+    res.locals.mcpScope = 'full' satisfies McpScope;
+    next();
+    return;
+  }
+  if (evalToken && constantTimeEquals(token, evalToken)) {
+    res.locals.mcpScope = 'argus_eval' satisfies McpScope;
+    next();
+    return;
+  }
+
+  res.status(401).json({ error: 'unauthorized' });
+};
+
+/**
  * Auth for POST /report only. Accepts a dedicated least-privilege
  * MCP_REPORT_TOKEN (what the fleet agents hold) OR the full MCP_BEARER_TOKEN
  * (admin). This lets cronus / ehr-inbox / hephaestus write telemetry WITHOUT a

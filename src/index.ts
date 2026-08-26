@@ -5,11 +5,12 @@ import cron from 'node-cron';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
-import { requireBearer, requireReportBearer } from './auth.js';
+import { requireBearer, requireMcpBearer, requireReportBearer, type McpScope } from './auth.js';
 import { reportHandler } from './report.js';
 import { toolsCallHandler } from './toolsCall.js';
 import { requestAgentStore } from './context.js';
 import { registerAllTools } from './register.js';
+import { registerArgusEvaluateLeaveTool } from './tools/argusEvaluateLeave.js';
 import { syncQualityVariance } from '../services/quality-variance-sync/index.js';
 
 function requireEnv(name: string): string {
@@ -27,7 +28,7 @@ function loadConfig() {
   };
 }
 
-function createMcpServer(): McpServer {
+function createMcpServer(scope: McpScope = 'full'): McpServer {
   const server = new McpServer(
     {
       name: 'nemesis-argus-bridge',
@@ -38,7 +39,12 @@ function createMcpServer(): McpServer {
         'Remote MCP bridge for NEMESIS (MDS pairing) and ARGUS (coverage / leave). Tools scope MDS rows by service_provider and clinicians by derived scribe_partner_site pattern; optional `region` on each tool (default MCP_DEFAULT_REGION). Invalid explicit `region` values throw. Holiday listing uses get_regional_holidays; get_bd_holidays is a BD-only alias. Set MCP_HOLIDAYS_HAVE_REGION=true after adding holidays.region in SQL. Use get_mds_profile with the correct region for pairing flows.',
     },
   );
-  registerAllTools(server);
+  if (scope === 'argus_eval') {
+    // ARGUS_EVAL_TOKEN callers (NEMESIS adhoc) get only the leave evaluator.
+    registerArgusEvaluateLeaveTool(server);
+  } else {
+    registerAllTools(server);
+  }
   return server;
 }
 
@@ -65,12 +71,13 @@ function main() {
   // const mcpRateLimiter = rateLimit({ windowMs: 60_000, max: 300, standardHeaders: true, legacyHeaders: false });
   // app.post('/mcp', mcpRateLimiter, requireBearer, handler);
 
-  app.post('/mcp', requireBearer, async (req, res) => {
+  app.post('/mcp', requireMcpBearer, async (req, res) => {
     const raw = req.headers['x-agent-name'];
     const agentName = typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : null;
+    const scope = (res.locals.mcpScope as McpScope | undefined) ?? 'full';
 
     await requestAgentStore.run({ agentName }, async () => {
-      const server = createMcpServer();
+      const server = createMcpServer(scope);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
